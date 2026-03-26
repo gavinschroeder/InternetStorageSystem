@@ -1,0 +1,10 @@
+.class
+*.class
+
+# Assignment build/output folders
+client_files/
+server_files/
+
+# IDE/system
+.DS_Store
+Thumbs.db

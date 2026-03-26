@@ -1,20 +1,27 @@
 /*
  * client.java
  * CIS4930 - Internet Storage Systems, Spring 2026
- * PA1: Capital Converter
+ * PA2: File Transfer Client
  *
- * A TCP client that connects to the Capital Converter server,
- * sends user-input strings, receives capitalized responses, and
- * measures round-trip time (RTT) in milliseconds. Prints RTT
- * statistics (min, mean, max, std dev) upon termination
+ * Connects to the server, prints "Hello!", then repeatedly sends a file name.
+ * If the server replies "SENDING <bytes>", the client receives exactly <bytes>
+ * bytes and saves the file to a predetermined folder. Measures round-trip time
+ * (RTT) for successful transfers and prints min/mean/max/stddev on exit.
+ *
+ * Termination: user types "bye" -> client sends it, receives "disconnected",
+ * prints "exit", and exits.
  */
 
-import java.io.BufferedReader;
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.Socket;
 import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -24,7 +31,12 @@ public class client {
 
     private static final String DISCONNECT_COMMAND = "bye";
     private static final String DISCONNECT_RESPONSE = "disconnected";
+    private static final String FILE_NOT_FOUND = "File not found";
     private static final String ERROR_PREFIX = "ERROR:";
+    private static final int MIN_RUNS_FOR_STATS = 5;
+
+    // Folder where received files are stored on client
+    private static final String DOWNLOAD_FOLDER = "client_files";
 
     public static void main(String[] args) {
         if (args.length != 2) {
@@ -42,13 +54,19 @@ public class client {
             return;
         }
 
-        try (Socket socket = new Socket(hostName, portNumber);
-             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-             Scanner scanner = new Scanner(System.in)) {
+        File downloadDir = new File(DOWNLOAD_FOLDER);
+        if (!downloadDir.exists()) {
+            downloadDir.mkdirs();
+        }
+        System.out.println("Saving received files to: " + downloadDir.getAbsolutePath());
 
-            // Receive and print greeting from server
-            String greeting = in.readLine();
+        try (
+                Socket socket = new Socket(hostName, portNumber);
+                InputStream rawIn = new BufferedInputStream(socket.getInputStream());
+                OutputStream rawOut = socket.getOutputStream();
+                Scanner scanner = new Scanner(System.in)
+        ) {
+            String greeting = readLine(rawIn);
             if (greeting != null) {
                 System.out.println(greeting);
             }
@@ -56,37 +74,69 @@ public class client {
             List<Double> rtts = new ArrayList<>();
 
             while (true) {
-                System.out.print("Enter an alphabet string (or 'bye' to quit): ");
-                String userInput = scanner.nextLine();
+                System.out.print("Enter a file name (or 'bye' to quit): ");
+                String userInput = scanner.nextLine().trim();
 
                 long startTime = System.nanoTime();
-                out.println(userInput);
+                sendLine(rawOut, userInput);
 
-                String response = in.readLine();
-                long endTime = System.nanoTime();
-
-                if (response == null) {
+                String responseLine = readLine(rawIn);
+                if (responseLine == null) {
                     System.out.println("Server closed the connection.");
                     break;
                 }
 
-                double rttMillis = (endTime - startTime) / 1_000_000.0;
-
                 if (DISCONNECT_COMMAND.equals(userInput)) {
-                    System.out.println(response);
+                    System.out.println(responseLine);
                     System.out.println("exit");
                     break;
-                } else if (response.startsWith(ERROR_PREFIX)) {
-                    System.out.println(response);
-                    // Do not count this RTT in statistics, as it is an error case
-                } else {
-                    System.out.println("Capitalized response: " + response);
-                    rtts.add(rttMillis);
                 }
+
+                if (FILE_NOT_FOUND.equals(responseLine)) {
+                    System.out.println(responseLine);
+                    continue;
+                }
+
+                if (responseLine.startsWith(ERROR_PREFIX)) {
+                    System.out.println(responseLine);
+                    continue;
+                }
+
+                if (!responseLine.startsWith("SENDING ")) {
+                    System.out.println("Unexpected server response: " + responseLine);
+                    continue;
+                }
+
+                long byteCount;
+                try {
+                    byteCount = Long.parseLong(responseLine.substring("SENDING ".length()).trim());
+                } catch (NumberFormatException e) {
+                    System.out.println("Invalid SENDING header: " + responseLine);
+                    continue;
+                }
+
+                File outFile = new File(downloadDir, safeLocalFileName(userInput));
+                try {
+                    receiveToFile(rawIn, outFile, byteCount);
+                } catch (IOException e) {
+                    System.out.println("ERROR: " + e.getMessage());
+                    continue;
+                }
+
+                long endTime = System.nanoTime();
+                double rttMillis = (endTime - startTime) / 1_000_000.0;
+                rtts.add(rttMillis);
+
+                System.out.println("Saved " + byteCount + " bytes to: " + outFile.getAbsolutePath());
+                System.out.println("RTT (ms): " + formatDouble(rttMillis));
             }
 
-            if (!rtts.isEmpty()) {
+            if (rtts.size() >= MIN_RUNS_FOR_STATS) {
                 printStatistics(rtts);
+            } else if (!rtts.isEmpty()) {
+                System.out.println();
+                System.out.println("Collected " + rtts.size() + " successful run(s).");
+                System.out.println("For PA2, run at least " + MIN_RUNS_FOR_STATS + " successful transfers to report min/mean/max/stddev.");
             } else {
                 System.out.println("No successful round-trip measurements were recorded.");
             }
@@ -96,6 +146,63 @@ public class client {
         } catch (IOException e) {
             System.err.println("I/O error while communicating with " + hostName + ": " + e.getMessage());
         }
+    }
+
+    private static void sendLine(OutputStream out, String line) throws IOException {
+        out.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+        out.flush();
+    }
+
+    /**
+     * Reads a line terminated by '\n' from a raw InputStream without buffering past the newline.
+     * Returns null on EOF with no bytes read.
+     */
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        while (true) {
+            int b = in.read();
+            if (b == -1) {
+                return sb.length() == 0 ? null : sb.toString();
+            }
+            if (b == '\n') {
+                break;
+            }
+            if (b != '\r') {
+                sb.append((char) b);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void receiveToFile(InputStream in, File outFile, long byteCount) throws IOException {
+        if (byteCount < 0) {
+            throw new IOException("Invalid byte count: " + byteCount);
+        }
+
+        byte[] buffer = new byte[8192];
+        long remaining = byteCount;
+
+        try (OutputStream fos = new BufferedOutputStream(new FileOutputStream(outFile))) {
+            while (remaining > 0) {
+                int toRead = (int) Math.min(buffer.length, remaining);
+                int read = in.read(buffer, 0, toRead);
+                if (read == -1) {
+                    throw new IOException("Connection closed while receiving file. Remaining bytes: " + remaining);
+                }
+                fos.write(buffer, 0, read);
+                remaining -= read;
+            }
+            fos.flush();
+        }
+    }
+
+    private static String safeLocalFileName(String requestedName) {
+        String name = requestedName;
+        name = name.replace("\\", "_").replace("/", "_");
+        if (name.isBlank()) {
+            return "downloaded_file";
+        }
+        return name;
     }
 
     private static void printStatistics(List<Double> rtts) {

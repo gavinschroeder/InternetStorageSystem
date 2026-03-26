@@ -47,17 +47,16 @@ The server:
 
 ### Run the client
 
-On the **client machine** (after the server is running):
+On the **client machine** (after the server is running). On Windows, use PowerShell or Command Prompt; the same `java` commands apply.
 
 ```bash
 java client [serverURL] [port_number]
 ```
 
-Example:
+Examples:
 
-```bash
-java client my-server-hostname 1234
-```
+- Remote server: `java client my-server-hostname 1234`
+- Same machine (e.g. client on Windows, server on same PC): `java client localhost 1234`
 
 The client:
 
