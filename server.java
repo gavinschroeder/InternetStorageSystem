@@ -1,40 +1,42 @@
 /*
  * server.java
  * CIS4930 - Internet Storage Systems, Spring 2026
- * PA2: File Transfer Server
+ * PA3: Concurrent Batched File Transfer Server
  */
 
 import java.io.BufferedInputStream;
-import java.io.BufferedReader;
 import java.io.BufferedOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Random;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class server {
 
     private static final String GREETING_MESSAGE = "Hello!";
     private static final String DISCONNECT_COMMAND = "bye";
     private static final String DISCONNECT_RESPONSE = "disconnected";
-    private static final String FILE_NOT_FOUND = "File not found";
-
-    // Folder where files are stored on server
+    private static final String INVALID_COMMAND_MESSAGE = "Please type a different command";
     private static final String STORAGE_FOLDER = "server_files";
+    private static final int FILES_PER_BATCH = 10;
+
+    private static final AtomicBoolean shutdownRequested = new AtomicBoolean(false);
+    private static final AtomicInteger activeClients = new AtomicInteger(0);
+    private static volatile ServerSocket serverSocketRef;
 
     public static void main(String[] args) {
         if (args.length != 1) {
@@ -57,46 +59,45 @@ public class server {
         }
         System.out.println("Serving files from: " + storageDir.getAbsolutePath());
 
-        //create thread pool to service concurrent clients cached thread pool will create new threads as needed
         ExecutorService executor = Executors.newCachedThreadPool();
         try (ServerSocket serverSocket = new ServerSocket(port)) {
+            serverSocketRef = serverSocket;
             System.out.println("Server listening on port " + port + "...");
 
-            //main accept loop --> accept connections and hand to the thread pool
-            while (true) {
+            while (!shutdownRequested.get()) {
                 try {
                     Socket clientSocket = serverSocket.accept();
+                    activeClients.incrementAndGet();
                     System.out.println("Client connected from " + clientSocket.getInetAddress());
-
-                    //submit handler task, handler closes the socket
                     executor.submit(new ClientHandler(clientSocket, storageDir));
+                } catch (SocketException e) {
+                    if (shutdownRequested.get()) {
+                        break;
+                    }
+                    System.err.println("Socket error while accepting connection: " + e.getMessage());
                 } catch (IOException e) {
-                    System.err.println("Error while accepting client connection: " + e.getMessage());
+                    if (!shutdownRequested.get()) {
+                        System.err.println("Error while accepting client connection: " + e.getMessage());
+                    }
                 }
             }
-
         } catch (IOException e) {
             System.err.println("Could not listen on port: " + e.getMessage());
         } finally {
-            //attempt graceful shutdown if the server ever exits the loop
+            shutdownRequested.set(true);
             executor.shutdown();
             try {
-                if (!executor.awaitTermination(5, TimeUnit.SECONDS)) {
+                if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
                     executor.shutdownNow();
                 }
             } catch (InterruptedException ie) {
                 executor.shutdownNow();
                 Thread.currentThread().interrupt();
             }
+            System.out.println("Server shutting down.");
         }
     }
 
-    // handles a single client connection in its own thread.
-    //flow = 
-    //send greeting message
-    //read client commands (single filename, SEND/bye)
-    //for SEND, send batch of 10 files in a client-specific random order
-    //for filename requests, send single file
     private static class ClientHandler implements Runnable {
         private final Socket socket;
         private final File storageDir;
@@ -105,56 +106,54 @@ public class server {
             this.socket = socket;
             this.storageDir = storageDir;
         }
+
+        @Override
         public void run() {
             try (
-                    BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                    InputStream rawIn = new BufferedInputStream(socket.getInputStream());
                     OutputStream rawOut = new BufferedOutputStream(socket.getOutputStream())
             ) {
-                //initial greeting
                 sendLine(rawOut, GREETING_MESSAGE);
 
-                String inputLine;
-                while ((inputLine = in.readLine()) != null) {
-                    inputLine = inputLine.trim();
-                    System.out.println("[" + socket.getInetAddress() + "] Received: " + inputLine);
-
-                    if (DISCONNECT_COMMAND.equals(inputLine)) {
-                        //reply and close this client handler, server process continues
-                        sendLine(rawOut, DISCONNECT_RESPONSE);
-                        break;
-                    }
-
-                    if ("SEND".equalsIgnoreCase(inputLine)) {
-                        //client requested batch send
-                        //client immediately follows with sequence line
-                        //client sends nothing additional, server generates random ordering
-                        List<Integer> sequence = null;
-                        //if client has immediate line available, read and try to parse as sequence
-                        if (in.ready()) {
-                            String maybeSeq = in.readLine();
-                            if (maybeSeq != null) {
-                                maybeSeq = maybeSeq.trim();
-                                if (maybeSeq.toUpperCase().startsWith("SEQ")) {
-                                    sequence = parseSequenceLine(maybeSeq.substring(3).trim());
-                                } else {
-                                    //not sequence line, treat it as a filename request
-                                    //process normally by putting it back into the flow
-                                    //processing this line as a filename request
-                                    processSingleFileRequest(maybeSeq, rawOut);
-                                    continue;
-                                }
-                            }
-                        }
-
-                        processBatchSend(sequence, rawOut);
-                        //after batch send, continue to listen for further commands from same client
+                String commandLine;
+                while ((commandLine = readLine(rawIn)) != null) {
+                    commandLine = commandLine.trim();
+                    if (commandLine.isEmpty()) {
+                        sendLine(rawOut, INVALID_COMMAND_MESSAGE);
                         continue;
                     }
 
-                    //treat input line as a filename request
-                    processSingleFileRequest(inputLine, rawOut);
-                }
+                    if (DISCONNECT_COMMAND.equalsIgnoreCase(commandLine)) {
+                        sendLine(rawOut, DISCONNECT_RESPONSE);
+                        requestServerShutdownIfLastClient();
+                        break;
+                    }
 
+                    if (!commandLine.toUpperCase().startsWith("SEND")) {
+                        sendLine(rawOut, INVALID_COMMAND_MESSAGE);
+                        continue;
+                    }
+
+                    int batchSize = parseBatchSize(commandLine);
+                    if (batchSize < 1 || batchSize > 3) {
+                        sendLine(rawOut, "ERROR: batch size must be 1, 2, or 3");
+                        continue;
+                    }
+
+                    String seqLine = readLine(rawIn);
+                    if (seqLine == null || !seqLine.toUpperCase().startsWith("SEQ ")) {
+                        sendLine(rawOut, "ERROR: expected SEQ line after SEND");
+                        continue;
+                    }
+
+                    List<Integer> order = parseSequenceLine(seqLine.substring(4).trim());
+                    if (order == null) {
+                        sendLine(rawOut, "ERROR: invalid sequence; expected numbers 1..10");
+                        continue;
+                    }
+
+                    processBatchSend(order, batchSize, rawOut);
+                }
             } catch (IOException e) {
                 System.err.println("Error while communicating with client: " + e.getMessage());
             } finally {
@@ -162,126 +161,115 @@ public class server {
                     socket.close();
                 } catch (IOException ignore) {
                 }
-                System.out.println("Connection closed: " + socket.getInetAddress());
+                int remaining = activeClients.decrementAndGet();
+                System.out.println("Connection closed: " + socket.getInetAddress() + " (active clients: " + remaining + ")");
             }
         }
-        //process a single filename request 
-        private void processSingleFileRequest(String requestedName, OutputStream rawOut) throws IOException {
-            File requestedFile = resolveSafeFile(storageDir, requestedName);
-            if (requestedFile == null || !requestedFile.exists() || !requestedFile.isFile()) {
-                System.out.println("File not found: " + new File(storageDir, requestedName).getAbsolutePath());
-                sendLine(rawOut, FILE_NOT_FOUND);
-                return;
-            }
 
+        private int parseBatchSize(String sendLine) {
+            String[] parts = sendLine.trim().split("\\s+");
+            if (parts.length < 2) {
+                return 1;
+            }
             try {
-                long fileSize = requestedFile.length();
-                System.out.println("Sending file: " + requestedFile.getName() + " (" + fileSize + " bytes)");
-
-                //backwards-compatible header = SENDING <bytes>
-                sendLine(rawOut, "SENDING " + fileSize);
-                sendFileBytes(rawOut, requestedFile);
-
-                System.out.println("File sent successfully: " + requestedFile.getName());
-            } catch (IOException e) {
-                System.err.println("Error sending file: " + e.getMessage());
-                sendLine(rawOut, "ERROR: " + e.getMessage());
-            } catch (Exception e) {
-                System.err.println("Unexpected error: " + e.getMessage());
-                sendLine(rawOut, "ERROR: " + e.getMessage());
+                return Integer.parseInt(parts[1]);
+            } catch (NumberFormatException e) {
+                return -1;
             }
         }
 
-        //process batch send of 10 files, if provided sequence is null or inv
-        //a random ordering will be generated
-        //files are selected from the storageDir and only regular files are considered 
-        //the server sends for each file a header followed immediately by raw bytes
-        private void processBatchSend(List<Integer> sequence, OutputStream rawOut) throws IOException {
-            //collect input files 
-            File[] allFiles = storageDir.listFiles();
-            if (allFiles == null) {
-                sendLine(rawOut, "ERROR: storage folder inaccessible");
+        private void processBatchSend(List<Integer> order, int batchSize, OutputStream rawOut) throws IOException {
+            List<File> pool = loadFilePool(storageDir);
+            if (pool.size() < FILES_PER_BATCH) {
+                sendLine(rawOut, "ERROR: need at least 10 files in server_files");
                 return;
             }
 
-            List<File> candidates = new ArrayList<>();
-            for (File f : allFiles) {
-                if (f != null && f.isFile()) {
-                    candidates.add(f);
+            sendLine(rawOut, "BATCH_BEGIN " + batchSize);
+            for (int round = 1; round <= batchSize; round++) {
+                for (int idx : order) {
+                    File f = pool.get(idx);
+                    long fileSize = f.length();
+                    sendLine(rawOut, "FILE " + f.getName() + " " + fileSize);
+                    sendFileBytes(rawOut, f);
                 }
             }
-
-            //sort deterministically so indexing is stable across runs
-            Collections.sort(candidates, Comparator.comparing(File::getName, String.CASE_INSENSITIVE_ORDER));
-
-            if (candidates.size() < 10) {
-                sendLine(rawOut, "ERROR: need at least 10 files in storage folder");
-                return;
-            }
-
-            //limit to first 10 files for the pool; client sequences are numbers 1..10
-            List<File> pool = new ArrayList<>(candidates.subList(0, 10));
-
-            //if sequence is null or invalid, generate random permutation
-            List<Integer> order;
-            if (sequence == null || sequence.size() != 10) {
-                order = new ArrayList<>();
-                for (int i = 0; i < 10; i++) order.add(i);
-                Collections.shuffle(order, new Random());
-            } else {
-                //convert 1-based client indices to 0-based and validate
-                order = new ArrayList<>();
-                for (int v : sequence) {
-                    int idx = v - 1;
-                    if (idx < 0 || idx >= 10) {
-                        // invalid index: fall back to random order
-                        order = new ArrayList<>();
-                        for (int i = 0; i < 10; i++) order.add(i);
-                        Collections.shuffle(order, new Random());
-                        break;
-                    }
-                    order.add(idx);
-                }
-            }
-
-            //send files in determined order
-            for (int idx : order) {
-                File f = pool.get(idx);
-                long fileSize = f.length();
-                System.out.println("[" + socket.getInetAddress() + "] Batch sending: " + f.getName() + " (" + fileSize + " bytes)");
-                //header includes filename so the client can name the received file appropriately
-                sendLine(rawOut, "SENDING " + fileSize + " " + f.getName());
-                sendFileBytes(rawOut, f);
-            }
-
-            System.out.println("[" + socket.getInetAddress() + "] Batch send complete.");
+            sendLine(rawOut, "BATCH_END");
         }
 
-        //parse a sequence line into a list of integers
-        //accepts comma or space separated numbers 
-        //returns null on parse failure
         private List<Integer> parseSequenceLine(String s) {
-            if (s == null) return null;
-            s = s.trim();
-            if (s.isEmpty()) return null;
-            String[] parts = s.split("[ ,]+");
-            List<Integer> out = new ArrayList<>();
+            String[] parts = s.split("[, ]+");
+            if (parts.length != FILES_PER_BATCH) {
+                return null;
+            }
+
+            boolean[] seen = new boolean[FILES_PER_BATCH + 1];
+            List<Integer> order = new ArrayList<>();
             try {
                 for (String p : parts) {
-                    if (p.isBlank()) continue;
-                    out.add(Integer.parseInt(p.trim()));
+                    int v = Integer.parseInt(p.trim());
+                    if (v < 1 || v > FILES_PER_BATCH || seen[v]) {
+                        return null;
+                    }
+                    seen[v] = true;
+                    order.add(v - 1);
                 }
             } catch (NumberFormatException e) {
                 return null;
             }
-            return out;
+            return order;
         }
     }
 
+    private static void requestServerShutdownIfLastClient() {
+        if (activeClients.get() == 1 && shutdownRequested.compareAndSet(false, true)) {
+            try {
+                if (serverSocketRef != null && !serverSocketRef.isClosed()) {
+                    serverSocketRef.close();
+                }
+            } catch (IOException ignore) {
+            }
+        }
+    }
+
+    private static List<File> loadFilePool(File storageDir) {
+        File[] allFiles = storageDir.listFiles();
+        List<File> candidates = new ArrayList<>();
+        if (allFiles == null) {
+            return candidates;
+        }
+        for (File f : allFiles) {
+            if (f != null && f.isFile()) {
+                candidates.add(f);
+            }
+        }
+        Collections.sort(candidates, Comparator.comparing(File::getName, String.CASE_INSENSITIVE_ORDER));
+        if (candidates.size() > FILES_PER_BATCH) {
+            return new ArrayList<>(candidates.subList(0, FILES_PER_BATCH));
+        }
+        return candidates;
+    }
+
     private static void sendLine(OutputStream out, String line) throws IOException {
-        byte[] bytes = (line + "\n").getBytes(StandardCharsets.UTF_8);
-        out.write(bytes);
+        out.write((line + "\n").getBytes(StandardCharsets.UTF_8));
         out.flush();
+    }
+
+    private static String readLine(InputStream in) throws IOException {
+        StringBuilder sb = new StringBuilder();
+        while (true) {
+            int b = in.read();
+            if (b == -1) {
+                return sb.length() == 0 ? null : sb.toString();
+            }
+            if (b == '\n') {
+                break;
+            }
+            if (b != '\r') {
+                sb.append((char) b);
+            }
+        }
+        return sb.toString();
     }
 
     private static void sendFileBytes(OutputStream out, File file) throws IOException {
@@ -293,46 +281,6 @@ public class server {
             }
             out.flush();
         }
-    }
-
-    //prevents requests like "..\\..\\secret" from escaping STORAGE_FOLDER
-    //returns null if resolved path is outside the storage directory
-    private static File resolveSafeFile(File storageDir, String requestedName) {
-        try {
-            //only allow simple filenames to avoid ambiguity
-            if (requestedName.contains("/") || requestedName.contains("\\") || requestedName.contains("..")) {
-                return null;
-            }
-
-            File candidate = new File(storageDir, requestedName);
-            if (!candidate.exists()) {
-                File ci = findCaseInsensitive(storageDir, requestedName);
-                if (ci != null) {
-                    candidate = ci;
-                }
-            }
-            String base = storageDir.getCanonicalPath() + File.separator;
-            String target = candidate.getCanonicalPath();
-            if (!target.startsWith(base)) {
-                return null;
-            }
-            return candidate;
-        } catch (IOException e) {
-            return null;
-        }
-    }
-
-    private static File findCaseInsensitive(File storageDir, String requestedName) {
-        File[] files = storageDir.listFiles();
-        if (files == null) {
-            return null;
-        }
-        for (File f : files) {
-            if (f != null && f.isFile() && f.getName().equalsIgnoreCase(requestedName)) {
-                return f;
-            }
-        }
-        return null;
     }
 }
 
