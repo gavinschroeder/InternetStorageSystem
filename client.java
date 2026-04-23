@@ -306,5 +306,15 @@ public class client {
     private static String sanitizeFileName(String name) {
         return name.replaceAll("[/\\\\:*?\"<>|]", "_");
     }
+
+    private static class FileHeader {
+        private final String fileName;
+        private final long fileSize;
+
+        private FileHeader(String fileName, long fileSize) {
+            this.fileName = fileName;
+            this.fileSize = fileSize;
+        }
+    }
 }
 

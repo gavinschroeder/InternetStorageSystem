@@ -16,6 +16,11 @@ public class server {
     private static final int    TOTAL_FILES     = 10;
     //directory on server that holds 10 image files
     private static final String STORAGE_FOLDER = "server_files";
+    private static final int FILES_PER_BATCH = 10;
+
+    private static final AtomicBoolean shutdownRequested = new AtomicBoolean(false);
+    private static final AtomicInteger activeClients = new AtomicInteger(0);
+    private static volatile ServerSocket serverSocketRef;
 
     //entry point
     public static void main(String[] args) {
@@ -54,11 +59,15 @@ public class server {
                     System.out.println("[Server] New client: " + clientSocket.getInetAddress());
                     //spawn dedicated ClientHandler thread, terminates automatically when run returns
                     executor.submit(new ClientHandler(clientSocket, storageDir));
+                } catch (SocketException e) {
+                    if (shutdownRequested.get()) {
+                        break;
+                    }
+                    System.err.println("Socket error while accepting connection: " + e.getMessage());
                 } catch (IOException e) {
                     System.err.println("[Server] Accept error: " + e.getMessage());
                 }
             }
-
         } catch (IOException e) {
             System.err.println("[Server] Cannot bind to port " + port + ": " + e.getMessage());
         } finally {
@@ -72,6 +81,7 @@ public class server {
                 executor.shutdownNow();
                 Thread.currentThread().interrupt();
             }
+            System.out.println("Server shutting down.");
         }
     }
 
@@ -152,6 +162,14 @@ public class server {
                     sendLine(rawOut, ERR_UNKNOWN_CMD);
                 }
 
+                    List<Integer> order = parseSequenceLine(seqLine.substring(4).trim());
+                    if (order == null) {
+                        sendLine(rawOut, "ERROR: invalid sequence; expected numbers 1..10");
+                        continue;
+                    }
+
+                    processBatchSend(order, batchSize, rawOut);
+                }
             } catch (IOException e) {
                 System.err.println("[ClientHandler] I/O error for " + socket.getInetAddress()
                         + ": " + e.getMessage());
@@ -223,6 +241,7 @@ public class server {
             System.out.println("[" + socket.getInetAddress()
                     + "] Batch send complete – " + total + " files.");
         }
+    }
 
         //parse sequence of integers, return null on failure
         private List<Integer> parseSequence(String s) {
@@ -233,8 +252,7 @@ public class server {
                 for (String p : parts) {
                     if (!p.isEmpty()) result.add(Integer.parseInt(p));
                 }
-            } catch (NumberFormatException e) {
-                return null;
+            } catch (IOException ignore) {
             }
             return result.isEmpty() ? null : result;
         }
